@@ -237,7 +237,7 @@ void loop() {
       Serial.print("% Wd:"); printIMT(epData.lastDelayMin * 60, 4);
       Serial.print("s nAcq:"); printIMT(nbrLoop, 4);
       Serial.print("p/sec Tot:"); printIMT(epData.ticksWater, 5);
-      Serial.print("mts Fx>Rf:"); printIMT(stateValveInSec, 3);
+      Serial.print("minutes Fx>Rf:"); printIMT(stateValveInSec, 3);
       Serial.println("p");
     }
     if (command == 'p') {
