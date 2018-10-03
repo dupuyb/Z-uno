@@ -2,10 +2,10 @@
 
 /*
   Version Z-Uno 1.8.4.app
-  Tools Programmer Z-Uno programmer
   Tools Borad Z-Wave>ME Z-Uno
   Fequency Europe
   Multicommand Disabled
+  Programmer: Z-uno programmer
 */
 // Debuger mode
 #define DEBUG
@@ -23,7 +23,7 @@
 
 // I/O definition
 #define REL_PIN       9  // pin 16 relay open or close valve
-#define BUZ_PIN      10  // pin 10 buzzer ring during valve moving 
+#define BUZ_PIN      10  // pin 10 buzzer ring during valve moving
 
 // Flux detector
 #define ANA_PIN_FX    A0 // pin 10 Sonor Flux sensor
@@ -50,9 +50,10 @@ uint32_t previousMillis = 0; // Last milli-second
 uint8_t seconds = 0;         // Seconds [0-59]
 uint8_t minutes = 0;         // Minutes [0-59]
 uint8_t heures  = 0;         // Hours
+uint8_t cumule  = 0;         // Numbre of seconds with fulx detected
 
 struct eprom_data {
-  uint32_t ticksWater;   // init at zero
+  uint32_t ticksWater;   // init at zero Number of cumulatted minutes
   uint16_t lastFluxRef;  // Init at 160 on 10 bits set at 50% from [05 to 100%]
   uint8_t  lastDelayMin; // Init at 60 secondes [from 1 to 99 minutes]
   bool     valveClose;   // True if valve is clsed
@@ -62,13 +63,13 @@ eprom_data    epData;            // Persistant data in EEprom
 
 // Channels declaration. This code reports the following to the Z-Wave controller:
 ZUNO_SETUP_CHANNELS(
-// - Binary valve state O=Close  
+// - Binary valve state O=Close
                     ZUNO_SWITCH_BINARY(getterValveSt, setterValveSt),
 // - Binary WarningTimer if WarningTimer > DelayTimer then close the valve
                     ZUNO_SWITCH_BINARY(getterValveWd, setterValveWd),
 // - Dimmer Reference for Flux detection if sensor > Reference then Water is streaming
                     ZUNO_SWITCH_MULTILEVEL(getterFluxRef, setterFluxRef),
-// - Dimmer DelayTimer form 0 to 99 seconds /!\
+// - Dimmer DelayTimer form 0 to 99 seconds
                     ZUNO_SWITCH_MULTILEVEL(getterDelayMin, setterDelayMin),
 // - Loudness Current Water sensor value
                     ZUNO_SENSOR_MULTILEVEL(ZUNO_SENSOR_MULTILEVEL_TYPE_LOUDNESS,
@@ -76,7 +77,7 @@ ZUNO_SETUP_CHANNELS(
                                            SENSOR_MULTILEVEL_SIZE_TWO_BYTES,
                                            SENSOR_MULTILEVEL_PRECISION_ONE_DECIMAL,
                                            getterFluxVal),
-// - Meter Ticks secondes total water stream
+// - Meter Ticks minutes total water stream
                     ZUNO_METER(ZUNO_METER_TYPE_WATER,
                                METER_RESET_ENABLE,
                                ZUNO_METER_WATER_SCALE_PULSECOUNT,
@@ -104,10 +105,10 @@ void setup() {
   pinMode(LED_PIN,    OUTPUT); // set LED pin as output keyboard
   pinMode(BTN_PIN_UP, INPUT_PULLUP); // set button pin as input
   pinMode(BTN_PIN_DN, INPUT_PULLUP); // set button pin as input
-  // pinMode(DIG_PIN_FX, INPUT); // No used 
+  // pinMode(DIG_PIN_FX, INPUT); // No used
   // White during startup
   setRGB(255, 255, 255);
-  
+
   // Get last values from EEPROM
   EEPROM.get(EEPROM_ADDR,  &epData, sizeof(eprom_data));
   // Check data
@@ -175,7 +176,7 @@ void loop() {
   // Listen Flux in pipe
   crtFluxValue = analogRead(ANA_PIN_FX);
   // Get Max flux add all and compute mean
-  // if (crtFluxValue > maxFluxValue) 
+  // if (crtFluxValue > maxFluxValue)
   maxFluxValue += crtFluxValue;
   nbrLoop++; // There is betwwen 1000 and 1100 loop per secondes
 
@@ -196,7 +197,11 @@ void loop() {
     // if valve is open do evaluation
     if (isValveClosed == false) {
       if (lastFluxValue > fluxRefAdj) {
-        epData.ticksWater++;
+        cumule ++;
+        if (cumule>=59) {
+          epData.ticksWater++;
+          cumule = 0;
+        }
         if (stateValveInSec == 0) {
           myzunoSendReport(2);
         }
@@ -229,10 +234,10 @@ void loop() {
       printHMS();
       Serial.print(" Fx:"); printFMT(pec, 2);
       Serial.print("% Rf:"); printFMT(ref, 2);
-      Serial.print("% Wd:"); printIMT(epData.lastDelayMin * 60, 4); 
+      Serial.print("% Wd:"); printIMT(epData.lastDelayMin * 60, 4);
       Serial.print("s nAcq:"); printIMT(nbrLoop, 4);
-      Serial.print("p/sec Tot:"); printIMT(epData.ticksWater, 5); 
-      Serial.print("s Fx>Rf:"); printIMT(stateValveInSec, 3); 
+      Serial.print("p/sec Tot:"); printIMT(epData.ticksWater, 5);
+      Serial.print("mts Fx>Rf:"); printIMT(stateValveInSec, 3);
       Serial.println("p");
     }
     if (command == 'p') {
@@ -243,6 +248,7 @@ void loop() {
     }
 #endif
 
+    // Reset number of loop
     nbrLoop = 0;
 
     // Both touch pressed
@@ -378,9 +384,9 @@ void setRGB(uint8_t r, uint8_t g, uint8_t b) {
     analogWrite(BLUE_PIN,  b);
   }
   if ( alarmDelay > 0 ) {
-    if ( (seconds & 0x1) == 0 ) 
+    if ( (seconds & 0x1) == 0 )
       digitalWrite(BUZ_PIN, HIGH);
-    else 
+    else
       digitalWrite(BUZ_PIN, LOW);
   } else {
     digitalWrite(BUZ_PIN, LOW);
@@ -462,7 +468,7 @@ void resetterTicksWater(byte v) { // Jamais appelé avec JEEDOM !!!
   // Reset compteur
   epData.ticksWater = v * 0;
   updateEprom();
-#ifdef DEBUG   
+#ifdef DEBUG
   if (command=='d') { Serial.println("resetterTicksWater at zero" ); }
 #endif
 }
@@ -488,4 +494,3 @@ uint8_t getterFluxRef(void) {
 #endif
   return ret;
 }
-
