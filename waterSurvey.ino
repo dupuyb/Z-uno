@@ -7,6 +7,8 @@
   Multicommand Disabled
   Programmer: Z-uno programmer
 */
+#define VERSION     "1.2" // Incremental version
+
 // Debuger mode
 #define DEBUG
 
@@ -37,13 +39,16 @@ int8_t command;                 // Serial command
 uint8_t lastButtonUp;           // Manual button open valve
 uint8_t lastButtonDn;           // Manual button close valve
 uint8_t pushboth;               // Up and Down are pressed a same time
-int16_t nbrLoop;                // Counter of number of mean for acquisition
-int16_t crtFluxValue;           // Crt Aqn 10 bits [from 0 to 1023]
-int32_t maxFluxValue;           // Max Aqn 10 bits [from 0 to 1023]
-int16_t lastFluxValue;          // Last 10 bits [from 0 to 1023]
-boolean isValveClosed = false;  // Valve must be colsed or open
+uint8_t initDoneSec;            // Time without flux evaluation
+uint16_t nbrLoop;               // Counter of number of mean for acquisition
+uint16_t crtFluxValue;          // Crt Aqn 10 bits [from 0 to 1023]
+uint32_t maxFluxValue;          // Max Aqn 10 bits [from 0 to 1023]
+uint16_t lastFluxValue;         // Last 10 bits [from 0 to 1023]
+uint16_t fluxRefAdj;            // Equal epData.lastFluxRef + fluxBase
+uint16_t fluxBase;
 uint16_t stateValveInSec = 0;   // Seconds valve since the valve is closed
 uint16_t alarmDelay = 0;        // Seconds where the buzzer is ringing
+boolean isValveClosed = false;  // Valve must be closed or opened
 
 // Timer simulation
 uint32_t previousMillis = 0; // Last milli-second
@@ -56,7 +61,7 @@ struct eprom_data {
   uint32_t ticksWater;   // init at zero Number of cumulatted minutes
   uint16_t lastFluxRef;  // Init at 160 on 10 bits set at 50% from [05 to 100%]
   uint8_t  lastDelayMin; // Init at 60 secondes [from 1 to 99 minutes]
-  bool     valveClose;   // True if valve is clsed
+  bool     valveClose;   // True if valve is closed
   uint8_t  crc8;
 };
 eprom_data    epData;            // Persistant data in EEprom
@@ -87,13 +92,68 @@ ZUNO_SETUP_CHANNELS(
 
 );
 
-ZUNO_SETUP_ASSOCIATIONS(ZUNO_ASSOCIATION_GROUP_SET_VALUE, ZUNO_ASSOCIATION_GROUP_SET_VALUE_AND_DIM);
+//ZUNO_SETUP_ASSOCIATIONS(ZUNO_ASSOCIATION_GROUP_SET_VALUE, ZUNO_ASSOCIATION_GROUP_SET_VALUE_AND_DIM);
+
+// lissage Savitzky-Golay Filter - Coefficients
+static float coeffQuad[19] = {-136, -51, 24, 89, 144, 189, 224, 249, 264, 269, 264, 249, 224, 189, 144,  89,  24, -51, -136};
+static float coeffA30[11] =  {-36,    9, 44, 69, 84,  89,  84,  69,  44,   9, -36};
+static float coeffN05[05] =  {-3,    12, 17, 12, -3};
+static uint16_t envelRt[19] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+static uint16_t envelMx[20] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+
+void store(uint16_t val, uint16_t *store, int sz) {
+  for (int i=0; i < sz; i++) {
+    if (i < (sz-1)) store[i] = store[i+1];
+    else store[i] = val;
+  }
+}
+// mean
+uint16_t meanDelay10sec(uint16_t val) {
+  store(val, envelMx, 20);
+  float sum = 0;
+  int nbr = 0;
+  for (int i=0; i < 10; i++) {
+    sum += envelMx[i];
+    if (envelMx[i]>0) nbr++;
+  }
+  if (nbr>0) return sum/nbr;
+  return 0;
+}
+
+uint16_t lissageGbl(uint16_t val, uint16_t *store, float *coeff, int sz, float di) {
+  float sum = 0;
+  for (int i=0; i < sz; i++) {
+    if (i < (sz-1)) store[i] = store[i+1];
+    else store[i] = val;
+    if (store[i]==0) return val;
+    sum += coeff[i] * store[i];
+  }
+  return (sum / di);
+}
+// 19 values [0-18]
+uint16_t lissageQuad(uint16_t val) {
+   return lissageGbl(val, envelRt, coeffQuad, 19, 2261.0);
+}
+// 11 values [0-10]
+uint16_t lissageA30(uint16_t val) {
+  return lissageGbl(val, envelRt, coeffA30, 11, 429.0);
+}
+// 5 values [0-4]
+uint16_t lissageN5(uint16_t val) {
+  return lissageGbl(val, envelRt, coeffN05, 5, 35.0);
+}
+
+// ExponentielFilter yn = w × xn + (1 – w) × yn – 1   (weight between 0-1)
+int16_t exponentielFilter (int32_t crtV, int32_t oldFiltredVal, float weight) {
+  return (int16_t) ((weight * (float)crtV)+((1.0 - weight) * (float)oldFiltredVal));
+}
 
 // the setup routine runs once when you press reset:
 void setup() {
   command = 0;
 #ifdef DEBUG
   Serial.begin(115200);
+  Serial.print("Version:"); Serial.println(VERSION);
 #endif
   previousMillis = millis();
   // Set I/O Directions
@@ -105,7 +165,7 @@ void setup() {
   pinMode(LED_PIN,    OUTPUT); // set LED pin as output keyboard
   pinMode(BTN_PIN_UP, INPUT_PULLUP); // set button pin as input
   pinMode(BTN_PIN_DN, INPUT_PULLUP); // set button pin as input
-  // pinMode(DIG_PIN_FX, INPUT); // No used
+  // pinMode(DIG_PIN_FX, INPUT); // No used initially come from sound detector
   // White during startup
   setRGB(255, 255, 255);
 
@@ -120,13 +180,15 @@ void setup() {
     epData.valveClose = false;  // Valve is Open
     updateEprom();
   } else {
-    // Restore previous state
-    isValveClosed = epData.valveClose;
+    // Restore previous state at startup
+    // Not restored because fluxBase must be computed at startup (initDoneSec=30sec)
+    // isValveClosed = epData.valveClose;
   }
+  // Init values
   maxFluxValue = 0;
-  // Relay switched off on reset and dischage off
-  // digitalWrite(REL_PIN, LOW); Set by isValveClosed
+  fluxBase = 0;
   digitalWrite(BUZ_PIN, LOW);
+  initDoneSec = 30;
 }
 
 // the loop routine runs over and over again forever:
@@ -147,10 +209,11 @@ void loop() {
   }
 #endif
 
-  boolean bothpushed = false;
   // read all buttons
+  boolean bothpushed = false;
   uint8_t crtButtonUp  = digitalRead(BTN_PIN_UP);
   uint8_t crtButtonDn  = digitalRead(BTN_PIN_DN);
+
   // Set action if button pushed
   lastButtonUp = getButton(crtButtonUp , lastButtonUp);
   lastButtonDn = getButton(crtButtonDn , lastButtonDn);
@@ -160,7 +223,7 @@ void loop() {
     pushboth = 0;
     if (lastButtonUp == 0) {
       if (isValveClosed == true) {
-        isValveClosed = false; // Open valse and wait action completed
+        isValveClosed = false; // Open valse
         stateValveInSec = 0;
       }
     } else {
@@ -171,34 +234,40 @@ void loop() {
         }
       }
     }
+#ifdef DEBUG
+      if (command == 'd' && ((lastButtonUp == 0) || (lastButtonDn == 0))) {
+        Serial.print("buttons(up,dn):" ); Serial.print(lastButtonUp, DEC);Serial.print(",");Serial.println(lastButtonDn, DEC);
+      }
+#endif
   }
 
-  // Listen Flux in pipe
-  crtFluxValue = analogRead(ANA_PIN_FX);
-  // Get Max flux add all and compute mean
-  // if (crtFluxValue > maxFluxValue)
+  // Listen Flux in pipe (envelRt) new value 20% old value 80%
+  crtFluxValue = exponentielFilter (analogRead(ANA_PIN_FX), crtFluxValue, 0.2);
+  // Get Max flux add all
   maxFluxValue += crtFluxValue;
-  nbrLoop++; // There is betwwen 1000 and 1100 loop per secondes
+  nbrLoop++;
 
   // Main loop every new second elapes
   if ( millis() - previousMillis > 1000L) {
     previousMillis = millis();
 
-    // Get Max Flux in pipe tube
-    lastFluxValue = (int16_t) (maxFluxValue/nbrLoop);
+    // Get Average Flux in pipe tube compute lissage
+    lastFluxValue = lissageA30 ((int16_t) (maxFluxValue/nbrLoop));
     maxFluxValue = 0;
 
     // Change level reference (low hysteresis)
-    uint16_t fluxRefAdj = epData.lastFluxRef;
-    if (stateValveInSec > 0 && fluxRefAdj > 3) {
-      fluxRefAdj = fluxRefAdj - 3;
-    }
+    fluxRefAdj = epData.lastFluxRef + fluxBase;
+    if (fluxRefAdj > 1024) fluxRefAdj=1023;
+
+    // Wait 30 seconds than the history buffers are full
+    if (initDoneSec>0) initDoneSec--;
 
     // if valve is open do evaluation
     if (isValveClosed == false) {
-      if (lastFluxValue > fluxRefAdj) {
+      // Sound (pipe flux) is upper than reference
+      if ( (initDoneSec == 0) && (lastFluxValue > fluxRefAdj) ) {
         cumule ++;
-        if (cumule>=59) {
+        if (cumule >= 59) {
           epData.ticksWater++;
           cumule = 0;
         }
@@ -206,14 +275,17 @@ void loop() {
           myzunoSendReport(2);
         }
         if ( (stateValveInSec / 60) < epData.lastDelayMin) {
-          // Every 4 seconds send getterValveWd
-          if ((stateValveInSec & 0x3) == 0x3) myzunoSendReport(2);
           stateValveInSec++;
+          // Every 4 seconds send getterValveWd
+          if ((stateValveInSec & 0x3) == 0x3) {
+            myzunoSendReport(2);
+          }
         } else {
           // Close valve
           isValveClosed = true;
         }
       } else {
+        fluxBase = meanDelay10sec(lastFluxValue);
         // Valve is closed
         if (stateValveInSec != 0) {
           stateValveInSec = 0;
@@ -230,19 +302,22 @@ void loop() {
 #ifdef DEBUG
     if (command == 'd') {
       float pec = lastFluxValue * (99.0 / 1023.0);
-      float ref = epData.lastFluxRef * (99.0 / 1023.0);
+      float ref = fluxRefAdj * (99.0 / 1023.0);
+      //Serial.print("\r");
       printHMS();
       Serial.print(" Fx:"); printFMT(pec, 2);
       Serial.print("% Rf:"); printFMT(ref, 2);
       Serial.print("% Wd:"); printIMT(epData.lastDelayMin * 60, 4);
       Serial.print("s nAcq:"); printIMT(nbrLoop, 4);
       Serial.print("p/sec Tot:"); printIMT(epData.ticksWater, 5);
-      Serial.print("minutes Fx>Rf:"); printIMT(stateValveInSec, 3);
-      Serial.println("p");
+      Serial.print("min Fx>Rf:"); printIMT(stateValveInSec, 3);
+      Serial.print("p valve:");
+      if (isValveClosed)Serial.println("OFF.");
+      else Serial.println("ON.");
     }
     if (command == 'p') {
       float pec = lastFluxValue * (99.0 / 1023.0);
-      float ref = epData.lastFluxRef * (99.0 / 1023.0);
+      float ref = fluxRefAdj * (99.0 / 1023.0);
       Serial.print(pec); Serial.print(" "); Serial.print(ref); Serial.print(" ");
       Serial.println(stateValveInSec);
     }
@@ -254,12 +329,11 @@ void loop() {
     // Both touch pressed
     if (bothpushed) {
       setRGB(0, 0, 255); // bleu
-      isValveClosed = false; // Open valse and wait action completed
+      isValveClosed = false; // Open valse
       stateValveInSec = 0;
-      if (pushboth++ == 4) {
-        // Reset total meter
+      if (pushboth++ == 4) { // pressed more than 4sec.
         setRGB(255, 255, 255); // bleu
-        resetterTicksWater(0);
+        resetterTicksWater(0);   // Reset total meter
         pushboth = 0;
         myzunoSendReport(6);
       }
@@ -287,6 +361,7 @@ void loop() {
     // Timer incrementation
     if (seconds++ == 59) {
       seconds = 0;
+      // Store data into NVM
       if (myCrc8((byte*)&epData, sizeof(eprom_data) - 1) != epData.crc8) {
         updateEprom();
         myzunoSendReport(6);
@@ -374,10 +449,13 @@ uint8_t getButton(uint8_t crt, uint8_t last) {
 // RGB setup
 void setRGB(uint8_t r, uint8_t g, uint8_t b) {
   if ( (seconds & 0x1) == 0 ) {
+    // Led blinking differentely while serial is used
     uint8_t s = ((command == 'd' || command == 'p') ? (5) : (0));
-    analogWrite(RED_PIN,   s);
-    analogWrite(GREEN_PIN, s);
-    analogWrite(BLUE_PIN,  s);
+    if (initDoneSec==0) {
+      analogWrite(RED_PIN,   s);
+      analogWrite(GREEN_PIN, s);
+      analogWrite(BLUE_PIN,  s);
+    }
   } else {
     analogWrite(RED_PIN,   r);
     analogWrite(GREEN_PIN, g);
@@ -396,14 +474,14 @@ void setRGB(uint8_t r, uint8_t g, uint8_t b) {
 // ------------------- Delay WatchDog-- --------------------------
 uint8_t getterDelayMin(void) {
 #ifdef DEBUG
-  if (command == 'd') { Serial.print("getterDelayMin(4):" ); Serial.println(epData.lastDelayMin, DEC); }
+  if (command == 'd') { Serial.print("+getterDelayMin(4):" ); Serial.println(epData.lastDelayMin, DEC); }
 #endif
   return epData.lastDelayMin;
 }
 
 void setterDelayMin(uint8_t value) {
 #ifdef DEBUG
-  if (command == 'd') { Serial.print("setterDelayMin:" ); Serial.println(value, DEC); }
+  if (command == 'd') { Serial.print("+setterDelayMin:" ); Serial.println(value, DEC); }
 #endif
   if (value == 0) value = 1;
   if (value > 99) value = 99;
@@ -414,22 +492,22 @@ void setterDelayMin(uint8_t value) {
 // 0 for closed 1-99 for open
 uint8_t getterValveSt(void) {
 #ifdef DEBUG
-  if (command == 'd') { Serial.print("getterValveSt(1):" ); Serial.println(isValveClosed); }
+  if (command == 'd') { Serial.print("-getterValveSt(1):" ); Serial.println(isValveClosed); }
 #endif
   return ((isValveClosed) ? 0x0 : 0xFF);
 }
 
 uint8_t getterValveWd(void) {
 #ifdef DEBUG
-  if (command == 'd') { Serial.print("getterValveWd(2):" ); Serial.println(stateValveInSec); }
+  if (command == 'd') { Serial.print("-getterValveWd(2):" ); Serial.println(stateValveInSec); }
 #endif
   return ((stateValveInSec == 0) ? 0xFF : 0x0);
 }
 
-// 0 for closed 1-99 for open
+//---- 0 for closed valve and 1-99 for open valve
 void setterValveSt(uint8_t value) {
 #ifdef DEBUG
-  if (command == 'd') { Serial.print("setterValveSt:" ); Serial.println(value); }
+  if (command == 'd') { Serial.print("+setterValveSt:" ); Serial.println(value); }
 #endif
   if (value > 0) {
     isValveClosed = false;
@@ -439,19 +517,19 @@ void setterValveSt(uint8_t value) {
   }
 }
 
-//-
+//---- Reset WD & open valve
 void setterValveWd(uint8_t value) {
 #ifdef DEBUG
-  if (command == 'd') { Serial.print("setterValveWd:" ); Serial.println(value, DEC); }
+  if (command == 'd') { Serial.print("+setterValveWd:" ); Serial.println(value, DEC); }
 #endif
-  stateValveInSec = 0; // Reset WD & open valve
+  stateValveInSec = 0;
   isValveClosed = false;
 }
 //----------------------- Flux value ------------------------------------
 
 int16_t getterFluxVal(void) {
 #ifdef DEBUG
-  if (command == 'd') { Serial.print("getterFluxVal(5):" ); Serial.println(lastFluxValue); }
+  if (command == 'd') { Serial.print("-getterFluxVal(5):" ); Serial.println(lastFluxValue); }
 #endif
   return lastFluxValue;
 }
@@ -459,24 +537,24 @@ int16_t getterFluxVal(void) {
 //----------------------- Meter Water ------------------------------------
 uint32_t getterTicksWater(void) {
 #ifdef DEBUG
-  if (command == 'd') { Serial.print("getterTicksWater(6):" ); Serial.println(epData.ticksWater); }
+  if (command == 'd') { Serial.print("-getterTicksWater(6):" ); Serial.println(epData.ticksWater); }
 #endif
   return epData.ticksWater;
 }
 
 void resetterTicksWater(byte v) { // Jamais appelé avec JEEDOM !!!
   // Reset compteur
-  epData.ticksWater = v * 0;
+  epData.ticksWater = 0;
   updateEprom();
 #ifdef DEBUG
-  if (command=='d') { Serial.println("resetterTicksWater at zero" ); }
+  if (command=='d') { Serial.println("+resetterTicksWater at zero" ); }
 #endif
 }
 //------------------------ Ref Sensor --------------------------------------
 void setterFluxRef(uint8_t value) {
 #ifdef DEBUG
   if (command == 'd') {
-    Serial.print("setterFluxRef:" ); Serial.println(value, DEC);
+    Serial.print("+setterFluxRef:" ); Serial.println(value, DEC);
   }
 #endif
   if (value > 99) value = 99;
@@ -489,7 +567,7 @@ uint8_t getterFluxRef(void) {
   uint8_t ret = (uint8_t)fl;
 #ifdef DEBUG
   if (command == 'd') {
-    Serial.print("getterFluxRef(3):(" ); Serial.print(ret, DEC); Serial.print(")=" ); Serial.println(epData.lastFluxRef, DEC);
+    Serial.print("-getterFluxRef(3):(" ); Serial.print(ret, DEC); Serial.print(")=" ); Serial.println(epData.lastFluxRef, DEC);
   }
 #endif
   return ret;
