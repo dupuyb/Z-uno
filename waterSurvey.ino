@@ -94,58 +94,54 @@ ZUNO_SETUP_CHANNELS(
 
 //ZUNO_SETUP_ASSOCIATIONS(ZUNO_ASSOCIATION_GROUP_SET_VALUE, ZUNO_ASSOCIATION_GROUP_SET_VALUE_AND_DIM);
 
+inline float getAsFloat(uint16_t val)  { return ((float)val * (99.0 / 1023.0)); }
+inline uint16_t getAsUint16(float val) { return (uint16_t) ((float)val * (1023.0 / 99.0) ); }
+
 // lissage Savitzky-Golay Filter - Coefficients
-static float coeffQuad[19] = {-136, -51, 24, 89, 144, 189, 224, 249, 264, 269, 264, 249, 224, 189, 144,  89,  24, -51, -136};
-static float coeffA30[11] =  {-36,    9, 44, 69, 84,  89,  84,  69,  44,   9, -36};
-static float coeffN05[05] =  {-3,    12, 17, 12, -3};
-static uint16_t envelRt[19] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-static uint16_t envelMx[20] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+//static float coeffQuad[19] = {-136, -51, 24, 89, 144, 189, 224, 249, 264, 269, 264, 249, 224, 189, 144,  89,  24, -51, -136};
+//static float coeffA30[11] =  {-36,    9, 44, 69, 84,  89,  84,  69,  44,   9, -36};
 
-void store(uint16_t val, uint16_t *store, int sz) {
-  for (int i=0; i < sz; i++) {
-    if (i < (sz-1)) store[i] = store[i+1];
-    else store[i] = val;
-  }
-}
 // mean
-uint16_t meanDelay10sec(uint16_t val) {
-  store(val, envelMx, 20);
+unsigned int kmean   = 0;
+uint16_t envelMx[10] = { 0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0 };
+float getDerive() {
+  uint8_t p = (kmean+8) % 10;
+  uint8_t n = (kmean+9) % 10;
+  return getAsFloat(envelMx[p]) - getAsFloat(envelMx[n]);
+}
+void store(uint16_t newval) {
+  envelMx[kmean] = newval;
+  kmean = (kmean+1) % 10;
+}
+uint16_t meanDelay5sec(uint16_t newval) {
+  store(newval);
   float sum = 0;
-  int nbr = 0;
-  for (int i=0; i < 10; i++) {
-    sum += envelMx[i];
-    if (envelMx[i]>0) nbr++;
+  unsigned int k =  (kmean+5) % 10;
+  for (unsigned int i=0; i < 5; i++) {
+    sum += envelMx[k];
+    k =  (k+1) % 10;
   }
-  if (nbr>0) return sum/nbr;
-  return 0;
+  sum = sum/5;
+  return (uint16_t)sum;
 }
 
-uint16_t lissageGbl(uint16_t val, uint16_t *store, float *coeff, int sz, float di) {
-  float sum = 0;
-  for (int i=0; i < sz; i++) {
-    if (i < (sz-1)) store[i] = store[i+1];
-    else store[i] = val;
-    if (store[i]==0) return val;
-    sum += coeff[i] * store[i];
+// FIR filter at 5 values [0-4]
+unsigned int kFir   = 0;
+float fir_coeffs[5] = {-3.0,12.0,17.0,12.0,-3.0};
+float fir_values[5] = {0.0,0.0,0.0,0.0,0.0};
+float lissageN5(float newval){
+  float output = 0;
+  fir_values[kFir] = newval;
+  for (int i=0; i<5; i++){
+    output += fir_coeffs[i] * fir_values[(i + kFir) % 5];
   }
-  return (sum / di);
-}
-// 19 values [0-18]
-uint16_t lissageQuad(uint16_t val) {
-   return lissageGbl(val, envelRt, coeffQuad, 19, 2261.0);
-}
-// 11 values [0-10]
-uint16_t lissageA30(uint16_t val) {
-  return lissageGbl(val, envelRt, coeffA30, 11, 429.0);
-}
-// 5 values [0-4]
-uint16_t lissageN5(uint16_t val) {
-  return lissageGbl(val, envelRt, coeffN05, 5, 35.0);
+  kFir = (kFir+1) % 5;
+  return output/35.0;
 }
 
 // ExponentielFilter yn = w × xn + (1 – w) × yn – 1   (weight between 0-1)
-int16_t exponentielFilter (int32_t crtV, int32_t oldFiltredVal, float weight) {
-  return (int16_t) ((weight * (float)crtV)+((1.0 - weight) * (float)oldFiltredVal));
+float exponentielFilter (float crtV, float oldFiltredVal, float weight) {
+  return ((weight * crtV) + ((1.0 - weight) * oldFiltredVal));
 }
 
 // the setup routine runs once when you press reset:
@@ -193,6 +189,7 @@ void setup() {
 
 // the loop routine runs over and over again forever:
 void loop() {
+  float diff = 0;
 #ifdef DEBUG
   while (Serial.available() > 0) {
     uint8_t c = (uint8_t)Serial.read();
@@ -252,7 +249,7 @@ void loop() {
     previousMillis = millis();
 
     // Get Average Flux in pipe tube compute lissage
-    lastFluxValue = lissageA30 ((int16_t) (maxFluxValue/nbrLoop));
+    lastFluxValue = (uint16_t)lissageN5 ((maxFluxValue/nbrLoop));
     maxFluxValue = 0;
 
     // Change level reference (low hysteresis)
@@ -285,7 +282,12 @@ void loop() {
           isValveClosed = true;
         }
       } else {
-        fluxBase = meanDelay10sec(lastFluxValue);
+        diff = getDerive(); 
+        if ( diff > -2.0 && diff < 2.0)
+          fluxBase = meanDelay5sec(lastFluxValue);
+        else
+          store(lastFluxValue);
+
         // Valve is closed
         if (stateValveInSec != 0) {
           stateValveInSec = 0;
@@ -301,8 +303,8 @@ void loop() {
 
 #ifdef DEBUG
     if (command == 'd') {
-      float pec = lastFluxValue * (99.0 / 1023.0);
-      float ref = fluxRefAdj * (99.0 / 1023.0);
+      float pec = getAsFloat(lastFluxValue);
+      float ref = getAsFloat(fluxRefAdj);
       //Serial.print("\r");
       printHMS();
       Serial.print(" Fx:"); printFMT(pec, 2);
@@ -312,12 +314,13 @@ void loop() {
       Serial.print("p/sec Tot:"); printIMT(epData.ticksWater, 5);
       Serial.print("min Fx>Rf:"); printIMT(stateValveInSec, 3);
       Serial.print("p valve:");
-      if (isValveClosed)Serial.println("OFF.");
-      else Serial.println("ON.");
+      if (isValveClosed)Serial.print("OFF. diff:");
+      else Serial.print("ON. diff:");
+      Serial.println( diff );
     }
     if (command == 'p') {
-      float pec = lastFluxValue * (99.0 / 1023.0);
-      float ref = fluxRefAdj * (99.0 / 1023.0);
+      float pec = getAsFloat(lastFluxValue);
+      float ref = getAsFloat(fluxRefAdj);
       Serial.print(pec); Serial.print(" "); Serial.print(ref); Serial.print(" ");
       Serial.println(stateValveInSec);
     }
@@ -558,12 +561,12 @@ void setterFluxRef(uint8_t value) {
   }
 #endif
   if (value > 99) value = 99;
-  epData.lastFluxRef = (int16_t)((float)value * (1023.0 / 99.0));
+  epData.lastFluxRef = getAsUint16(value);
   updateEprom();
 }
 
 uint8_t getterFluxRef(void) {
-  float fl = (epData.lastFluxRef * (99.0 / 1023.0));
+  float fl = getAsFloat(epData.lastFluxRef);
   uint8_t ret = (uint8_t)fl;
 #ifdef DEBUG
   if (command == 'd') {
