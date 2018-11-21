@@ -7,12 +7,12 @@
   Multicommand Disabled
   Programmer: Z-uno programmer
 */
-#define VERSION     "1.2" // Incremental version
+#define VERSION     "1.2.1" // Incremental version
 
 // Debuger mode
 #define DEBUG
 
-#define LED_PIN       13 // pin 13 User LED of Z-Uno board  /!\ Connrcted to PMW1
+#define LED_PIN       13 // pin 13 User LED of Z-Uno board  /!\ Connected to PMW1
 
 // buttons definition
 #define BTN_PIN_UP    18 // pin 18 Button UP Manual button open valve
@@ -97,53 +97,6 @@ ZUNO_SETUP_CHANNELS(
 inline float getAsFloat(uint16_t val)  { return ((float)val * (99.0 / 1023.0)); }
 inline uint16_t getAsUint16(float val) { return (uint16_t) ((float)val * (1023.0 / 99.0) ); }
 
-// lissage Savitzky-Golay Filter - Coefficients
-//static float coeffQuad[19] = {-136, -51, 24, 89, 144, 189, 224, 249, 264, 269, 264, 249, 224, 189, 144,  89,  24, -51, -136};
-//static float coeffA30[11] =  {-36,    9, 44, 69, 84,  89,  84,  69,  44,   9, -36};
-
-// mean
-unsigned int kmean   = 0;
-uint16_t envelMx[10] = { 0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0 };
-float getDerive() {
-  uint8_t p = (kmean+8) % 10;
-  uint8_t n = (kmean+9) % 10;
-  return getAsFloat(envelMx[p]) - getAsFloat(envelMx[n]);
-}
-void store(uint16_t newval) {
-  envelMx[kmean] = newval;
-  kmean = (kmean+1) % 10;
-}
-uint16_t meanDelay5sec(uint16_t newval) {
-  store(newval);
-  float sum = 0;
-  unsigned int k =  (kmean+5) % 10;
-  for (unsigned int i=0; i < 5; i++) {
-    sum += envelMx[k];
-    k =  (k+1) % 10;
-  }
-  sum = sum/5;
-  return (uint16_t)sum;
-}
-
-// FIR filter at 5 values [0-4]
-unsigned int kFir   = 0;
-float fir_coeffs[5] = {-3.0,12.0,17.0,12.0,-3.0};
-float fir_values[5] = {0.0,0.0,0.0,0.0,0.0};
-float lissageN5(float newval){
-  float output = 0;
-  fir_values[kFir] = newval;
-  for (int i=0; i<5; i++){
-    output += fir_coeffs[i] * fir_values[(i + kFir) % 5];
-  }
-  kFir = (kFir+1) % 5;
-  return output/35.0;
-}
-
-// ExponentielFilter yn = w × xn + (1 – w) × yn – 1   (weight between 0-1)
-float exponentielFilter (float crtV, float oldFiltredVal, float weight) {
-  return ((weight * crtV) + ((1.0 - weight) * oldFiltredVal));
-}
-
 // the setup routine runs once when you press reset:
 void setup() {
   command = 0;
@@ -198,9 +151,15 @@ void loop() {
     } else {
       if (command == 'd') {
         Serial.println("Command in debug mode...");
+        Serial.println(VERSION);
       } else {
-        if (command == 'p') Serial.println("Command in plotter mode...");
-        else Serial.println("Command stop serial.");
+        if (command == 'p') {
+          Serial.println("Command in plotter mode...");
+        } else {
+          if (command == 'r' ) asm volatile ("  jmp 0");
+          Serial.println("Command stop serial.");
+        }
+        Serial.println(VERSION);
       }
     }
   }
@@ -238,8 +197,8 @@ void loop() {
 #endif
   }
 
-  // Listen Flux in pipe (envelRt) new value 20% old value 80%
-  crtFluxValue = exponentielFilter (analogRead(ANA_PIN_FX), crtFluxValue, 0.2);
+  // Listen Flux in pipe (envelRt) new value 33% old value 66%
+  crtFluxValue =  (crtFluxValue*2 + analogRead(ANA_PIN_FX)) / 3;
   // Get Max flux add all
   maxFluxValue += crtFluxValue;
   nbrLoop++;
@@ -249,7 +208,7 @@ void loop() {
     previousMillis = millis();
 
     // Get Average Flux in pipe tube compute lissage
-    lastFluxValue = (uint16_t)lissageN5 ((maxFluxValue/nbrLoop));
+    lastFluxValue =  (uint16_t)(maxFluxValue/nbrLoop);
     maxFluxValue = 0;
 
     // Change level reference (low hysteresis)
@@ -282,11 +241,8 @@ void loop() {
           isValveClosed = true;
         }
       } else {
-        diff = getDerive(); 
-        if ( diff > -2.0 && diff < 2.0)
-          fluxBase = meanDelay5sec(lastFluxValue);
-        else
-          store(lastFluxValue);
+        // (1*lastFluxValue + 4*fluxBase) / 5
+        fluxBase = (lastFluxValue + fluxBase*4) / 5;
 
         // Valve is closed
         if (stateValveInSec != 0) {
@@ -302,6 +258,7 @@ void loop() {
     }
 
 #ifdef DEBUG
+    diff = getAsFloat(lastFluxValue) - getAsFloat(fluxBase);
     if (command == 'd') {
       float pec = getAsFloat(lastFluxValue);
       float ref = getAsFloat(fluxRefAdj);
@@ -372,6 +329,10 @@ void loop() {
       if (minutes++ == 59) {
         minutes = 0;
         heures++;
+      }
+      if ( heures == 24*3 ) {
+        heures = 0;
+        asm volatile ("  jmp 0");
       }
     }
   }
